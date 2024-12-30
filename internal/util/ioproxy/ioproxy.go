@@ -3,6 +3,7 @@ package ioproxy
 import (
 	"encoding/binary"
 	"io"
+	"k8s.io/klog"
 	"sync"
 	"time"
 )
@@ -27,12 +28,17 @@ type IoProxy struct {
 	prefix  StdType
 	buf     []byte
 	flusher bool
-	lock    sync.Mutex
+	lock    *sync.Mutex
 }
 
 // New will return a new IoProxy instance.
-func New(w io.Writer, prefix StdType) *IoProxy {
-	return &IoProxy{out: w, prefix: prefix, buf: []byte{}}
+func New(w io.Writer, prefix StdType, lock *sync.Mutex) *IoProxy {
+	return &IoProxy{
+		out:    w,
+		prefix: prefix,
+		buf:    []byte{},
+		lock:   lock,
+	}
 }
 
 // Write will write given data to the an internal buffer, which will be
@@ -54,11 +60,24 @@ func (w *IoProxy) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-// process will go through the buffer and writes chunks that end with
-// a newline to the output writer.
+func (w *IoProxy) writeAll(writer io.Writer, buf []byte) error {
+	for len(buf) > 0 {
+		n, err := writer.Write(buf)
+		if err != nil {
+			return err
+		}
+		buf = buf[n:]
+	}
+	return nil
+}
+
+// process iterates over the buffer and writes chunks that end with
+// a newline character to the output writer.
 func (w *IoProxy) process() int {
-	for pos := 0; pos < len(w.buf)-1; pos++ {
-		if w.buf[pos] == 10 { // write chunk if newline char is found
+	bufferLength := len(w.buf)
+	// Iterate over the buffer to find newline characters
+	for pos := 0; pos < bufferLength; pos++ {
+		if w.buf[pos] == '\n' {
 			w.write(w.buf[:pos+1])
 			w.buf = w.buf[pos+1:]
 			return pos + 1
@@ -68,19 +87,30 @@ func (w *IoProxy) process() int {
 }
 
 // write will write data to the configured writer, using the correct header.
-func (w *IoProxy) write(p []byte) (int, error) {
+func (w *IoProxy) write(p []byte) error {
 	header := [8]byte{}
 	header[0] = byte(w.prefix)
 	binary.BigEndian.PutUint32(header[4:], uint32(len(p)))
-	w.out.Write(header[:])
-	return w.out.Write(p)
+	err := w.writeAll(w.out, header[:])
+	if err != nil {
+		klog.Errorf("Error when writing docker log header: %v", err)
+		return err
+	}
+	err = w.writeAll(w.out, p)
+	if err != nil {
+		klog.Errorf("Error ehen writing docker log content: %v", err)
+	}
+	return err
 }
 
 // Flush will write all buffer data still present.
 func (w *IoProxy) Flush() error {
 	w.lock.Lock()
 	defer w.lock.Unlock()
-	_, err := w.write(w.buf)
+	if len(w.buf) == 0 {
+		return nil
+	}
+	err := w.write(w.buf)
 	w.buf = []byte{}
 	w.flusher = false
 	return err
